@@ -1,4 +1,4 @@
-FROM nginx:1.13.1-alpine
+FROM nginx:alpine
 MAINTAINER David Siaw davidsiaw@gmail.com
 
 ENV VIRTUAL_HOST example.example.com

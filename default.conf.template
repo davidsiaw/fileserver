@@ -8,10 +8,11 @@ server {
 
     include /etc/nginx/default.d/*.conf;
 
-
+    absolute_redirect off;
     location / {
         root   /var/www/static;
         index  index.html index.htm;
+        #try_files $uri $uri/index.html =404;
     }
 
     location /mp4/ {
