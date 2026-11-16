@@ -1,0 +1,7 @@
+# Image user should not be 'root'.
+# Accepted: nginx.conf runs the master process as root so it can drop its
+# worker processes to the unprivileged `nginx` user (`user nginx;`), same as
+# the upstream image.
+# (Both ID formats listed; older Trivy versions report it as DS002.)
+DS-0002
+DS002

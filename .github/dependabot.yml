@@ -1,0 +1,23 @@
+version: 2
+updates:
+  # Bumps the FROM nginx:<version>-alpine tag in the Dockerfile.
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+    # nginx odd minors (1.31, 1.33...) are the "mainline" branch; even ones are
+    # "stable". Only take patch releases within the current stable line.
+    # Remove this to also get minor bumps (which would include mainline).
+    ignore:
+      - dependency-name: nginx
+        update-types: ["version-update:semver-minor"]
+
+  # Bumps actions in .github/workflows, including the SHA-pinned ones
+  # (it updates the SHA and the "# vX.Y.Z" comment together).
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]

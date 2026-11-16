@@ -1,0 +1,196 @@
+name: Security and quality
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  schedule:
+    # Weekly re-scan so new CVEs in the nginx base image get picked up
+    # even when nothing in this repo changes.
+    - cron: "0 3 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  IMAGE: fileserver:ci
+  OSV_SCANNER_VERSION: v2.7.1
+  # Code scanning uploads need security-events: write, which fork PRs don't get.
+  CAN_UPLOAD_SARIF: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+
+jobs:
+  lint:
+    name: Lint (hadolint, shellcheck)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: hadolint Dockerfile
+        uses: hadolint/hadolint-action@06be81baf89a55ffd0e24b8f04a4185738dd3387 # v3.5.0
+        with:
+          dockerfile: Dockerfile
+
+      - name: shellcheck start.sh
+        run: shellcheck start.sh
+
+  smoke-test:
+    name: Build and smoke test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Build image
+        run: docker build -t "$IMAGE" .
+
+      - name: Prepare static files
+        run: |
+          mkdir -p www/mp4
+          echo 'hello from fileserver' > www/index.html
+          echo 'not really an mp4' > www/mp4/readme.txt
+
+      - name: Start fileserver
+        run: |
+          docker run -d --name fileserver -p 8080:8080 \
+            -v "$PWD/www:/var/www/static:ro" \
+            -e VIRTUAL_HOST=test.local "$IMAGE"
+
+      - name: Generated nginx config is valid
+        run: |
+          sleep 2
+          docker exec fileserver cat /etc/nginx/nginx.conf
+          docker exec fileserver cat /etc/nginx/conf.d/default.conf
+          docker exec fileserver nginx -t
+
+      - name: Static files are served
+        run: |
+          curl -fsS --retry 10 --retry-delay 1 --retry-all-errors \
+            -H 'Host: test.local' http://localhost:8080/ | grep -q 'hello from fileserver'
+          curl -fsS -H 'Host: test.local' http://localhost:8080/mp4/readme.txt | grep -q 'not really an mp4'
+          curl -fsS -H 'Host: test.local' http://localhost:8080/_stats | grep -q 'Active connections'
+
+      - name: Missing files return 404
+        run: |
+          code=$(curl -s -o /dev/null -w '%{http_code}' -H 'Host: test.local' http://localhost:8080/nope.html)
+          test "$code" = 404
+
+      - name: Container logs
+        if: always()
+        run: docker logs fileserver || true
+
+  trivy:
+    name: Trivy
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Build image
+        run: docker build -t "$IMAGE" .
+
+      - name: Trivy config scan (Dockerfile misconfigurations)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: config
+          scan-ref: .
+          trivyignores: .trivyignore
+          format: sarif
+          output: trivy-config.sarif
+
+      - name: Trivy image scan (report)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: image
+          image-ref: ${{ env.IMAGE }}
+          format: sarif
+          output: trivy-image.sarif
+
+      - name: Upload Trivy config results
+        if: always() && env.CAN_UPLOAD_SARIF == 'true'
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: trivy-config.sarif
+          category: trivy-config
+
+      - name: Upload Trivy image results
+        if: always() && env.CAN_UPLOAD_SARIF == 'true'
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: trivy-image.sarif
+          category: trivy-image
+
+      # The gate: fail on HIGH/CRITICAL vulnerabilities that already have a fix
+      # (usually meaning "bump the nginx base image tag").
+      - name: Trivy image scan (gate)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: image
+          image-ref: ${{ env.IMAGE }}
+          format: table
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: "1"
+          skip-setup-trivy: true
+
+  osv-scanner:
+    name: OSV-Scanner
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install osv-scanner
+        run: |
+          base="https://github.com/google/osv-scanner/releases/download/${OSV_SCANNER_VERSION}"
+          curl -fsSLO "$base/osv-scanner_linux_amd64"
+          curl -fsSLO "$base/osv-scanner_SHA256SUMS"
+          grep ' osv-scanner_linux_amd64$' osv-scanner_SHA256SUMS | sha256sum -c -
+          install -m 0755 osv-scanner_linux_amd64 /usr/local/bin/osv-scanner
+          rm osv-scanner_linux_amd64 osv-scanner_SHA256SUMS
+          osv-scanner --version
+
+      # This repo has no language lockfiles; its dependencies are the OS
+      # packages in the nginx/alpine base image, so scan the built image.
+      - name: Build and export image
+        run: |
+          docker build -t "$IMAGE" .
+          docker save "$IMAGE" -o image.tar
+
+      - name: OSV-Scanner image scan
+        id: osv
+        run: |
+          set +e
+          osv-scanner scan image --archive image.tar --format sarif --output-file osv.sarif
+          echo "exit_code=$?" >> "$GITHUB_OUTPUT"
+          osv-scanner scan image --archive image.tar --format table
+          exit 0
+
+      - name: Upload OSV-Scanner results
+        if: always() && env.CAN_UPLOAD_SARIF == 'true'
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: osv.sarif
+          category: osv-scanner-image
+
+      # Exit codes: 0 = clean, 1 = vulnerabilities found, anything else = error.
+      - name: Fail on vulnerabilities
+        if: steps.osv.outputs.exit_code != '0'
+        run: |
+          echo "osv-scanner exited with ${{ steps.osv.outputs.exit_code }}"
+          exit 1
