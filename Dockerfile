@@ -1,4 +1,4 @@
-FROM nginx:1.30.6-alpine
+FROM nginx:1.30.7-alpine
 LABEL maintainer="David Siaw <davidsiaw@gmail.com>"
 
 # The upstream nginx image is only rebuilt every so often, so Alpine security
